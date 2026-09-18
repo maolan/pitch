@@ -1,0 +1,21 @@
+[package]
+name = "maolan-pitch"
+version = "0.0.1"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "Neural pitch detection (FCPE) and pitch-correction resynthesis (PC-NSF-HiFiGAN) for vocal pitch correction, on Burn"
+repository = "https://github.com/maolan/pitch"
+homepage = "https://maolan.rs"
+keywords = ["audio", "pitch", "f0", "fcpe", "burn"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+anyhow = "1.0.104"
+burn = { version = "0.21.0", default-features = false, features = ["std", "wgpu"] }
+burn-store = { version = "0.21.0", default-features = false, features = ["burnpack", "std", "memmap"] }
+huggingface-hub = { package = "hf-hub", version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
+rubato = "5.0"
+rustfft = "6.4"
+tracing = "0.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
