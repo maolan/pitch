@@ -33,7 +33,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use burn::tensor::Tensor;
 use burn::tensor::TensorData;
 use burn::tensor::activation::{leaky_relu, sigmoid, silu};
-use burn::tensor::backend::Backend;
 use burn_store::{BurnpackStore, ModuleStore};
 use std::path::Path;
 
@@ -60,30 +59,30 @@ fn cent_table() -> Vec<f32> {
         .collect()
 }
 
-struct ConvModuleWeights<B: Backend> {
-    norm_w: Tensor<B, 1>,
-    norm_b: Tensor<B, 1>,
-    pw_w: Tensor<B, 3>,
-    pw_b: Tensor<B, 1>,
-    dw_w: Tensor<B, 3>,
-    dw_b: Tensor<B, 1>,
-    out_w: Tensor<B, 3>,
-    out_b: Tensor<B, 1>,
+struct ConvModuleWeights {
+    norm_w: Tensor<1>,
+    norm_b: Tensor<1>,
+    pw_w: Tensor<3>,
+    pw_b: Tensor<1>,
+    dw_w: Tensor<3>,
+    dw_b: Tensor<1>,
+    out_w: Tensor<3>,
+    out_b: Tensor<1>,
 }
 
 /// Loaded FCPE parameters.
-pub struct FcpeWeights<B: Backend> {
-    in_w: Tensor<B, 3>,
-    in_b: Tensor<B, 1>,
-    gn_w: Tensor<B, 1>,
-    gn_b: Tensor<B, 1>,
-    in2_w: Tensor<B, 3>,
-    in2_b: Tensor<B, 1>,
-    layers: Vec<ConvModuleWeights<B>>,
-    norm_w: Tensor<B, 1>,
-    norm_b: Tensor<B, 1>,
-    out_w: Tensor<B, 2>,
-    out_b: Tensor<B, 1>,
+pub struct FcpeWeights {
+    in_w: Tensor<3>,
+    in_b: Tensor<1>,
+    gn_w: Tensor<1>,
+    gn_b: Tensor<1>,
+    in2_w: Tensor<3>,
+    in2_b: Tensor<1>,
+    layers: Vec<ConvModuleWeights>,
+    norm_w: Tensor<1>,
+    norm_b: Tensor<1>,
+    out_w: Tensor<2>,
+    out_b: Tensor<1>,
 }
 
 type TensorLookup = dyn Fn(&str) -> Option<(Vec<f32>, Vec<usize>)>;
@@ -96,44 +95,43 @@ fn get_tensor(store: &TensorLookup, name: &str, shape: &[usize]) -> Result<Vec<f
     Ok(data)
 }
 
-fn tensor1<B: Backend>(device: &B::Device, data: Vec<f32>) -> Tensor<B, 1> {
+fn tensor1(device: &burn::tensor::Device, data: Vec<f32>) -> Tensor<1> {
     let len = data.len();
     Tensor::from_data(TensorData::new(data, [len]), device)
 }
 
-fn tensor2<B: Backend>(device: &B::Device, data: Vec<f32>, d0: usize, d1: usize) -> Tensor<B, 2> {
+fn tensor2(device: &burn::tensor::Device, data: Vec<f32>, d0: usize, d1: usize) -> Tensor<2> {
     Tensor::from_data(TensorData::new(data, [d0, d1]), device)
 }
 
-fn tensor3<B: Backend>(
-    device: &B::Device,
+fn tensor3(
+    device: &burn::tensor::Device,
     data: Vec<f32>,
     d0: usize,
     d1: usize,
     d2: usize,
-) -> Tensor<B, 3> {
+) -> Tensor<3> {
     Tensor::from_data(TensorData::new(data, [d0, d1, d2]), device)
 }
 
-impl<B: Backend> FcpeWeights<B> {
+impl FcpeWeights {
     /// Load weights from a Burn Pack (`.bpk`) exported from the FCPE ONNX
     /// checkpoint. Tensors are looked up by their dotted ONNX name.
-    pub fn from_burnpack(path: &Path, device: &B::Device) -> Result<Self> {
+    pub fn from_burnpack(path: &Path, device: &burn::tensor::Device) -> Result<Self> {
         use burn::tensor::DType;
 
         let snapshots = BurnpackStore::from_file(path)
-            .zero_copy(true)
-            .get_all_snapshots()
+            .get_all_tensors()
             .with_context(|| format!("failed to read burnpack {}", path.display()))?
             .clone();
 
         let store = move |name: &str| -> Option<(Vec<f32>, Vec<usize>)> {
             snapshots.values().find_map(|snap| {
-                if snap.full_path() == name {
-                    let data = snap.to_data().ok()?;
-                    if data.dtype == DType::F32 {
-                        let shape = data.shape.to_vec();
-                        let values: Vec<f32> = data.to_vec::<f32>().ok()?;
+                if snap.name == name {
+                    let data = burn_store::bridge::to_data(snap).ok()?;
+                    if data.dtype() == DType::F32 {
+                        let shape = data.shape().to_vec();
+                        let values: Vec<f32> = data.try_to_vec::<f32>().ok()?;
                         Some((values, shape))
                     } else {
                         None
@@ -147,7 +145,7 @@ impl<B: Backend> FcpeWeights<B> {
         Self::from_lookup(&store, device)
     }
 
-    fn from_lookup(store: &TensorLookup, device: &B::Device) -> Result<Self> {
+    fn from_lookup(store: &TensorLookup, device: &burn::tensor::Device) -> Result<Self> {
         let in_w = get_tensor(store, "model.input_stack.0.weight", &[HIDDEN, N_BINS, 3])?;
         let in_b = get_tensor(store, "model.input_stack.0.bias", &[HIDDEN])?;
         // GroupNorm affine parameters, exported as broadcastable [512, 1]
@@ -226,7 +224,7 @@ impl<B: Backend> FcpeWeights<B> {
         })
     }
 
-    fn layer_norm(x: Tensor<B, 3>, w: &Tensor<B, 1>, b: &Tensor<B, 1>) -> Tensor<B, 3> {
+    fn layer_norm(x: Tensor<3>, w: &Tensor<1>, b: &Tensor<1>) -> Tensor<3> {
         // normalize over the last dim (biased variance, eps = 1e-5)
         let mean = x.clone().mean_dim(2);
         let centered = x.clone().sub(mean.clone());
@@ -243,17 +241,16 @@ impl<B: Backend> FcpeWeights<B> {
     }
 
     fn conv1d(
-        x: Tensor<B, 3>,
-        weight: &Tensor<B, 3>,
-        bias: &Tensor<B, 1>,
+        x: Tensor<3>,
+        weight: &Tensor<3>,
+        bias: &Tensor<1>,
         padding: usize,
         groups: usize,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let stride = 1;
-        let options = burn::tensor::ops::PaddedConvOptions::asymmetric(
+        let options = burn::tensor::ops::ConvOptions::new_with_padding(
             [stride],
-            [padding],
-            [padding],
+            [(padding, padding)],
             [1],
             groups,
         );
@@ -266,7 +263,7 @@ impl<B: Backend> FcpeWeights<B> {
         let device = self.in_w.device();
         let n_frames = features.len();
         let flat: Vec<f32> = features.iter().flatten().copied().collect();
-        let x = Tensor::<B, 3>::from_data(TensorData::new(flat, [1, n_frames, N_BINS]), &device);
+        let x = Tensor::<3>::from_data(TensorData::new(flat, [1, n_frames, N_BINS]), &device);
 
         // input stack: (B, T, C) -> (B, C, T) for conv1d
         let x = x.swap_dims(1, 2);
@@ -274,7 +271,7 @@ impl<B: Backend> FcpeWeights<B> {
 
         // GroupNorm(4, 512): normalize each group of 128 channels over
         // all of its (channel, time) values
-        let mut group_normed: Vec<Tensor<B, 3>> = Vec::with_capacity(GROUPS);
+        let mut group_normed: Vec<Tensor<3>> = Vec::with_capacity(GROUPS);
         let group_ch = HIDDEN / GROUPS;
         let time = x.dims()[2];
         for g in 0..GROUPS {
@@ -332,7 +329,7 @@ impl<B: Backend> FcpeWeights<B> {
         let logits = x.matmul(self.out_w.clone().unsqueeze_dim::<3>(0)).add(bias);
         let latent = sigmoid(logits);
         let data = latent.into_data();
-        let values: Vec<f32> = data.to_vec::<f32>().expect("latent tensor is f32");
+        let values: Vec<f32> = data.try_to_vec::<f32>().expect("latent tensor is f32");
         values
             .chunks(OUT_DIMS)
             .map(|chunk| chunk.to_vec())

@@ -1,7 +1,7 @@
 # maolan-pitch
 
 Neural pitch analysis and pitch-correction resynthesis for the
-[Maolan](https://maolan.rs) DAW, running on [Burn](https://burn.dev) 0.21
+[Maolan](https://maolan.rs) DAW, running on [Burn](https://burn.dev) 0.22
 with the wgpu (Vulkan) backend.
 
 The crate provides two model pipelines, both implemented from scratch in
@@ -63,9 +63,8 @@ let vocoder = PcNsfHifiGan::new(load_pc_nsf_hifigan_weights(&bpk)?);
 let pcm_44k1 = vocoder.synthesize(&mel_frames, &f0_hz);
 ```
 
-Everything is generic over `burn::tensor::backend::Backend` with the
-default alias `maolan_pitch::B` = wgpu; a CPU backend could be
-reintroduced by adding an alias and a loader for it.
+Models and tensors use Burn 0.22 runtime devices. The public loaders initialize
+a Vulkan wgpu device; pitch inference requires a working GPU.
 
 ## Validation binary
 

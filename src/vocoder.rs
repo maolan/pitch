@@ -37,7 +37,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use burn::tensor::TensorData;
 use burn::tensor::activation::{leaky_relu, tanh};
-use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, ops::ConvTransposeOptions};
 use burn_store::{BurnpackStore, ModuleStore};
 use std::path::Path;
@@ -62,30 +61,30 @@ const CHUNK_FRAMES: usize = 400;
 const CHUNK_CONTEXT: usize = 40;
 const CROSSFADE_SAMPLES: usize = 512;
 
-struct Conv1dW<B: Backend> {
-    w: Tensor<B, 3>,
-    b: Tensor<B, 1>,
+struct Conv1dW {
+    w: Tensor<3>,
+    b: Tensor<1>,
 }
 
-struct ResBlockW<B: Backend> {
-    convs1: [Conv1dW<B>; 3],
-    convs2: [Conv1dW<B>; 3],
+struct ResBlockW {
+    convs1: [Conv1dW; 3],
+    convs2: [Conv1dW; 3],
     dilations: [usize; 3],
     kernel_size: usize,
 }
 
 /// Loaded PC-NSF-HiFiGAN generator parameters.
-pub struct PcNsfHifiGanWeights<B: Backend> {
-    conv_pre: Conv1dW<B>,
-    ups: Vec<Conv1dW<B>>,
-    resblocks: Vec<ResBlockW<B>>,
-    source_conv: Conv1dW<B>,
-    conv_post: Conv1dW<B>,
+pub struct PcNsfHifiGanWeights {
+    conv_pre: Conv1dW,
+    ups: Vec<Conv1dW>,
+    resblocks: Vec<ResBlockW>,
+    source_conv: Conv1dW,
+    conv_post: Conv1dW,
 }
 
 /// PC-NSF-HiFiGAN vocoder.
-pub struct PcNsfHifiGan<B: Backend = crate::B> {
-    weights: PcNsfHifiGanWeights<B>,
+pub struct PcNsfHifiGan {
+    weights: PcNsfHifiGanWeights,
 }
 
 /// Materialize a torch weight_norm pair: `w = g * v / ||v||` per dim-0 slice.
@@ -149,26 +148,25 @@ pub fn fastsinegen(f0: &[f32], upp: usize, source_sr: f32) -> Vec<f32> {
     out
 }
 
-impl<B: Backend> PcNsfHifiGanWeights<B> {
+impl PcNsfHifiGanWeights {
     /// Load generator weights from a Burn Pack (`.bpk`) exported from the
     /// PC-NSF-HiFiGAN checkpoint. Tensors are looked up by their dotted
     /// state-dict name and weight-norm pairs are materialized at load time.
-    pub fn from_burnpack(path: &Path, device: &B::Device) -> Result<Self> {
+    pub fn from_burnpack(path: &Path, device: &burn::tensor::Device) -> Result<Self> {
         use burn::tensor::DType;
 
         let snapshots = BurnpackStore::from_file(path)
-            .zero_copy(true)
-            .get_all_snapshots()
+            .get_all_tensors()
             .with_context(|| format!("failed to read burnpack {}", path.display()))?
             .clone();
 
         let store = move |name: &str| -> Option<(Vec<f32>, Vec<usize>)> {
             snapshots.values().find_map(|snap| {
-                if snap.full_path() == name {
-                    let data = snap.to_data().ok()?;
-                    if data.dtype == DType::F32 {
-                        let shape = data.shape.to_vec();
-                        let values: Vec<f32> = data.to_vec::<f32>().ok()?;
+                if snap.name == name {
+                    let data = burn_store::bridge::to_data(snap).ok()?;
+                    if data.dtype() == DType::F32 {
+                        let shape = data.shape().to_vec();
+                        let values: Vec<f32> = data.try_to_vec::<f32>().ok()?;
                         Some((values, shape))
                     } else {
                         None
@@ -192,8 +190,8 @@ impl<B: Backend> PcNsfHifiGanWeights<B> {
         let load_wn = |prefix: &str,
                        shape: [usize; 3],
                        bias_len: usize,
-                       device: &B::Device|
-         -> Result<Conv1dW<B>> {
+                       device: &burn::tensor::Device|
+         -> Result<Conv1dW> {
             let v = get(&format!("{prefix}.weight_v"), &shape)?;
             let g = get(&format!("{prefix}.weight_g"), &[shape[0], 1, 1])?;
             let w = materialize_weight_norm(&v, &g, shape);
@@ -271,18 +269,18 @@ impl<B: Backend> PcNsfHifiGanWeights<B> {
     }
 }
 
-fn tensor1<B: Backend>(device: &B::Device, data: Vec<f32>) -> Tensor<B, 1> {
+fn tensor1(device: &burn::tensor::Device, data: Vec<f32>) -> Tensor<1> {
     let len = data.len();
     Tensor::from_data(TensorData::new(data, [len]), device)
 }
 
-fn tensor3<B: Backend>(
-    device: &B::Device,
+fn tensor3(
+    device: &burn::tensor::Device,
     data: Vec<f32>,
     d0: usize,
     d1: usize,
     d2: usize,
-) -> Tensor<B, 3> {
+) -> Tensor<3> {
     Tensor::from_data(TensorData::new(data, [d0, d1, d2]), device)
 }
 
@@ -291,23 +289,22 @@ fn conv_padding(kernel_size: usize, dilation: usize) -> usize {
     (kernel_size * dilation - dilation) / 2
 }
 
-impl<B: Backend> PcNsfHifiGan<B> {
-    pub fn new(weights: PcNsfHifiGanWeights<B>) -> Self {
+impl PcNsfHifiGan {
+    pub fn new(weights: PcNsfHifiGanWeights) -> Self {
         Self { weights }
     }
 
-    fn conv1d(x: Tensor<B, 3>, conv: &Conv1dW<B>, padding: usize, dilation: usize) -> Tensor<B, 3> {
-        let options = burn::tensor::ops::PaddedConvOptions::asymmetric(
+    fn conv1d(x: Tensor<3>, conv: &Conv1dW, padding: usize, dilation: usize) -> Tensor<3> {
+        let options = burn::tensor::ops::ConvOptions::new_with_padding(
             [1],
-            [padding],
-            [padding],
+            [(padding, padding)],
             [dilation],
             1,
         );
         burn::tensor::module::conv1d(x, conv.w.clone(), Some(conv.b.clone()), options)
     }
 
-    fn resblock(x: Tensor<B, 3>, block: &ResBlockW<B>) -> Tensor<B, 3> {
+    fn resblock(x: Tensor<3>, block: &ResBlockW) -> Tensor<3> {
         let mut x = x;
         for (l, (c1, c2)) in block.convs1.iter().zip(&block.convs2).enumerate() {
             let d = block.dilations[l];
@@ -336,13 +333,13 @@ impl<B: Backend> PcNsfHifiGan<B> {
         let device = self.weights.conv_pre.w.device();
         let frames = mel.len();
         let flat: Vec<f32> = mel.iter().flatten().copied().collect();
-        let mut x = Tensor::<B, 3>::from_data(TensorData::new(flat, [1, frames, N_MELS]), &device)
+        let mut x = Tensor::<3>::from_data(TensorData::new(flat, [1, frames, N_MELS]), &device)
             .swap_dims(1, 2); // [1, 128, T]
 
         x = Self::conv1d(x, &self.weights.conv_pre, 3, 1);
 
         let har_t =
-            Tensor::<B, 3>::from_data(TensorData::new(har.to_vec(), [1, 1, har.len()]), &device);
+            Tensor::<3>::from_data(TensorData::new(har.to_vec(), [1, 1, har.len()]), &device);
 
         for (i, up) in self.weights.ups.iter().enumerate() {
             x = leaky_relu(x, f64::from(LRELU_SLOPE));
@@ -359,7 +356,7 @@ impl<B: Backend> PcNsfHifiGan<B> {
                 let src = Self::conv1d(har_t.clone(), &self.weights.source_conv, 0, 1);
                 x = x.add(src);
             }
-            let mut xs: Option<Tensor<B, 3>> = None;
+            let mut xs: Option<Tensor<3>> = None;
             for j in 0..NUM_KERNELS {
                 let block = &self.weights.resblocks[i * NUM_KERNELS + j];
                 let out = Self::resblock(x.clone(), block);
@@ -377,7 +374,7 @@ impl<B: Backend> PcNsfHifiGan<B> {
         x = Self::conv1d(x, &self.weights.conv_post, 3, 1);
         x = tanh(x);
 
-        x.into_data().to_vec::<f32>().unwrap_or_default()
+        x.into_data().try_to_vec::<f32>().unwrap_or_default()
     }
 
     /// Synthesize audio from log-mel features and an f0 contour.

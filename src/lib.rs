@@ -12,17 +12,10 @@ pub mod vmel;
 pub mod vocoder;
 
 use anyhow::{Context, Result, anyhow};
-use burn::tensor::backend::Backend;
 use std::path::{Path, PathBuf};
 
 pub use fcpe::FcpeWeights;
 pub use vocoder::{PcNsfHifiGan, PcNsfHifiGanWeights};
-
-/// Inference backend: wgpu (Vulkan-first), following the setup used by
-/// `maolan-generate`. Every API is generic over `burn::tensor::backend::Backend`,
-/// so a CPU backend could be reintroduced later by adding a type alias and a
-/// loader for it.
-pub type B = burn::backend::Wgpu<f32, i64, u32>;
 
 /// Create the default wgpu device, initialized for Vulkan with exclusive
 /// memory pages (mirrors `maolan-generate`'s runtime setup). Initialization
@@ -32,24 +25,26 @@ pub type B = burn::backend::Wgpu<f32, i64, u32>;
 ///
 /// Panics if no suitable GPU adapter can be initialized; `load_fcpe_weights`
 /// and friends turn this into a descriptive error.
-pub fn wgpu_device() -> burn::backend::wgpu::WgpuDevice {
-    let device = burn::backend::wgpu::WgpuDevice::default();
-    let status = GPU_INIT.get_or_init(|| {
-        std::panic::catch_unwind(|| {
-            burn::backend::wgpu::init_setup::<burn::backend::wgpu::graphics::Vulkan>(
-                &device,
-                burn::backend::wgpu::RuntimeOptions {
-                    memory_config: burn::backend::wgpu::MemoryConfiguration::ExclusivePages,
-                    ..Default::default()
-                },
-            );
+pub fn wgpu_device() -> burn::tensor::Device {
+    GPU_INIT
+        .get_or_init(|| {
+            std::panic::catch_unwind(|| {
+                burn::tensor::Device::wgpu_options()
+                    .graphics_api(burn::tensor::wgpu::WgpuBackend::Vulkan)
+                    .memory_config(burn::tensor::wgpu::MemoryConfiguration::ExclusivePages)
+                    .init()
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(panic_payload_to_string)
+            .and_then(|result| result)
         })
-        .map_err(panic_payload_to_string)
-    });
-    if let Err(detail) = status {
-        panic!("maolan-pitch requires a working Vulkan GPU (wgpu initialization failed): {detail}");
-    }
-    device
+        .as_ref()
+        .unwrap_or_else(|detail| {
+            panic!(
+                "maolan-pitch requires a working Vulkan GPU (wgpu initialization failed): {detail}"
+            )
+        })
+        .clone()
 }
 
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -60,9 +55,10 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
-static GPU_INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+static GPU_INIT: std::sync::OnceLock<Result<burn::tensor::Device, String>> =
+    std::sync::OnceLock::new();
 
-fn wgpu_device_or_err() -> Result<burn::backend::wgpu::WgpuDevice> {
+fn wgpu_device_or_err() -> Result<burn::tensor::Device> {
     std::panic::catch_unwind(wgpu_device)
         .map_err(|payload| anyhow!(panic_payload_to_string(payload)))
 }
@@ -102,14 +98,14 @@ pub struct F0Frame {
 }
 
 /// Neural F0 detector backed by FCPE weights.
-pub struct FcpeDetector<B: Backend = self::B> {
-    weights: FcpeWeights<B>,
+pub struct FcpeDetector {
+    weights: FcpeWeights,
     threshold: f32,
     kind: PitchDetectorKind,
 }
 
-impl<B: Backend> FcpeDetector<B> {
-    pub fn new(weights: FcpeWeights<B>) -> Self {
+impl FcpeDetector {
+    pub fn new(weights: FcpeWeights) -> Self {
         Self {
             weights,
             threshold: 0.05,
@@ -174,7 +170,7 @@ impl<B: Backend> FcpeDetector<B> {
 ///
 /// Returns an error mentioning the Vulkan requirement if the GPU cannot be
 /// initialized.
-pub fn load_fcpe_weights(path: &Path) -> Result<FcpeWeights<B>> {
+pub fn load_fcpe_weights(path: &Path) -> Result<FcpeWeights> {
     let device = wgpu_device_or_err()?;
     FcpeWeights::from_burnpack(path, &device)
         .with_context(|| format!("failed to load FCPE weights from {}", path.display()))
@@ -216,7 +212,7 @@ pub fn ensure_fcpe_model(cache_dir: &Path) -> Result<PathBuf> {
 ///
 /// Returns an error mentioning the Vulkan requirement if the GPU cannot be
 /// initialized.
-pub fn load_pc_nsf_hifigan_weights(path: &Path) -> Result<PcNsfHifiGanWeights<B>> {
+pub fn load_pc_nsf_hifigan_weights(path: &Path) -> Result<PcNsfHifiGanWeights> {
     let device = wgpu_device_or_err()?;
     PcNsfHifiGanWeights::from_burnpack(path, &device)
         .with_context(|| format!("failed to load vocoder weights from {}", path.display()))
@@ -455,7 +451,7 @@ mod vocoder_tests {
         audio
     }
 
-    fn mean_detected_f0(detector: &FcpeDetector<B>, audio: &[f32]) -> Option<f32> {
+    fn mean_detected_f0(detector: &FcpeDetector, audio: &[f32]) -> Option<f32> {
         let frames = detector.detect_f0(audio, vmel::SAMPLE_RATE, |_| {});
         let voiced: Vec<f32> = frames.iter().filter_map(|f| f.frequency).collect();
         if voiced.is_empty() {

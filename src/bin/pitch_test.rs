@@ -40,7 +40,7 @@ fn parse_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 /// Detector loaded on the default wgpu backend.
 struct LoadedDetector {
-    inner: Box<FcpeDetector<maolan_pitch::B>>,
+    inner: Box<FcpeDetector>,
 }
 
 impl LoadedDetector {
